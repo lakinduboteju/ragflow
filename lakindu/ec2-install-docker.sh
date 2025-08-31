@@ -1,4 +1,8 @@
 #!/bin/bash
+# Installing Docker and Docker Compose on EC2 instance running Amazon Linux 2023
+
+# Stop at first error
+set -e
 
 # Installing Docker
 # Reference: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-docker.html
