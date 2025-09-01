@@ -27,3 +27,4 @@ bash ./lakindu/bring-up.sh
 
 - `0-code-overview.md` - High-level architecture, codebase organization, technologies overview
 - `1-rag.md` - RAG's Document Parsing and Chunking overview
+- `2-rag.md` - RAG's Retrieval deep dive
