@@ -1808,7 +1808,8 @@ Retrieves chunks from specified datasets.
   - `"rerank_id"`: `string`  
   - `"keyword"`: `boolean`  
   - `"highlight"`: `boolean`
-  - `"cross_languages"`: `list[string]`  
+  - `"cross_languages"`: `list[string]`
+  - `"metadata_condition"`: `object`
 
 ##### Request example
 
@@ -1855,7 +1856,8 @@ curl --request POST \
   - `false`: Disable highlighting of matched terms (default).
 - `"cross_languages"`: (*Body parameter*) `list[string]`  
   The languages that should be translated into, in order to achieve keywords retrievals in different languages.
-
+- `"metadata_condition"`: (*Body parameter*), `object`  
+  The metadata condition for filtering chunks.
 #### Response
 
 Success:
@@ -3811,7 +3813,7 @@ Lists agents.
 #### Request
 
 - Method: GET
-- URL: `/api/v1/agents?page={page}&page_size={page_size}&orderby={orderby}&desc={desc}&name={agent_name}&id={agent_id}`
+- URL: `/api/v1/agents?page={page}&page_size={page_size}&orderby={orderby}&desc={desc}&title={agent_name}&id={agent_id}`
 - Headers:
   - `'Authorization: Bearer <YOUR_API_KEY>'`
 
@@ -3819,7 +3821,7 @@ Lists agents.
 
 ```bash
 curl --request GET \
-     --url http://{address}/api/v1/agents?page={page}&page_size={page_size}&orderby={orderby}&desc={desc}&name={agent_name}&id={agent_id} \
+     --url http://{address}/api/v1/agents?page={page}&page_size={page_size}&orderby={orderby}&desc={desc}&title={agent_name}&id={agent_id} \
      --header 'Authorization: Bearer <YOUR_API_KEY>'
 ```
 
@@ -3837,7 +3839,7 @@ curl --request GET \
   Indicates whether the retrieved agents should be sorted in descending order. Defaults to `true`.
 - `id`: (*Filter parameter*), `string`  
   The ID of the agent to retrieve.
-- `name`: (*Filter parameter*), `string`  
+- `title`: (*Filter parameter*), `string`  
   The name of the agent to retrieve.
 
 #### Response
@@ -4100,3 +4102,77 @@ Failure:
 ```
 
 ---
+
+### System
+---
+### Check system health
+
+**GET** `/v1/system/healthz`
+
+Check the health status of RAGFlow’s dependencies (database, Redis, document engine, object storage).
+
+#### Request
+
+- Method: GET
+- URL: `/v1/system/healthz`
+- Headers:
+  - 'Content-Type: application/json'
+  (no Authorization required)
+
+##### Request example
+
+```bash
+curl --request GET
+     --url http://{address}/v1/system/healthz
+     --header 'Content-Type: application/json'
+```
+
+##### Request parameters
+
+- `address`: (*Path parameter*), string  
+  The host and port of the backend service (e.g., `localhost:7897`).
+
+---
+
+#### Responses
+
+- **200 OK** – All services healthy
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "db": "ok",
+  "redis": "ok",
+  "doc_engine": "ok",
+  "storage": "ok",
+  "status": "ok"
+}
+```
+
+- **500 Internal Server Error** – At least one service unhealthy
+
+```http
+HTTP/1.1 500 INTERNAL SERVER ERROR
+Content-Type: application/json
+
+{
+  "db": "ok",
+  "redis": "nok",
+  "doc_engine": "ok",
+  "storage": "ok",
+  "status": "nok",
+  "_meta": {
+    "redis": {
+      "elapsed": "5.2",
+      "error": "Lost connection!"
+    }
+  }
+}
+```
+
+Explanation:  
+- Each service is reported as "ok" or "nok".  
+- The top-level `status` reflects overall health.  
+- If any service is "nok", detailed error info appears in `_meta`.  
