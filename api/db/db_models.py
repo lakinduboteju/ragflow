@@ -313,9 +313,75 @@ class RetryingPooledMySQLDatabase(PooledMySQLDatabase):
                     raise
 
 
+class RetryingPooledPostgresqlDatabase(PooledPostgresqlDatabase):
+    def __init__(self, *args, **kwargs):
+        self.max_retries = kwargs.pop("max_retries", 5)
+        self.retry_delay = kwargs.pop("retry_delay", 1)
+        super().__init__(*args, **kwargs)
+
+    def execute_sql(self, sql, params=None, commit=True):
+        for attempt in range(self.max_retries + 1):
+            try:
+                return super().execute_sql(sql, params, commit)
+            except (OperationalError, InterfaceError) as e:
+                # PostgreSQL specific error codes
+                # 57P01: admin_shutdown
+                # 57P02: crash_shutdown
+                # 57P03: cannot_connect_now
+                # 08006: connection_failure
+                # 08003: connection_does_not_exist
+                # 08000: connection_exception
+                error_messages = ['connection', 'server closed', 'connection refused', 
+                                'no connection to the server', 'terminating connection']
+                
+                should_retry = any(msg in str(e).lower() for msg in error_messages)
+
+                if should_retry and attempt < self.max_retries:
+                    logging.warning(
+                        f"PostgreSQL connection issue (attempt {attempt+1}/{self.max_retries}): {e}"
+                    )
+                    self._handle_connection_loss()
+                    time.sleep(self.retry_delay * (2 ** attempt))
+                else:
+                    logging.error(f"PostgreSQL execution failure: {e}")
+                    raise
+        return None
+
+    def _handle_connection_loss(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            self.connect()
+        except Exception as e:
+            logging.error(f"Failed to reconnect to PostgreSQL: {e}")
+            time.sleep(0.1)
+            self.connect()
+
+    def begin(self):
+        for attempt in range(self.max_retries + 1):
+            try:
+                return super().begin()
+            except (OperationalError, InterfaceError) as e:
+                error_messages = ['connection', 'server closed', 'connection refused',
+                                'no connection to the server', 'terminating connection']
+                
+                should_retry = any(msg in str(e).lower() for msg in error_messages)
+
+                if should_retry and attempt < self.max_retries:
+                    logging.warning(
+                        f"PostgreSQL connection lost during transaction (attempt {attempt+1}/{self.max_retries})"
+                    )
+                    self._handle_connection_loss()
+                    time.sleep(self.retry_delay * (2 ** attempt))
+                else:
+                    raise
+
+
 class PooledDatabase(Enum):
     MYSQL = RetryingPooledMySQLDatabase
-    POSTGRES = PooledPostgresqlDatabase
+    POSTGRES = RetryingPooledPostgresqlDatabase
 
 
 class DatabaseMigrator(Enum):
@@ -641,7 +707,7 @@ class TenantLLM(DataBaseModel):
     llm_factory = CharField(max_length=128, null=False, help_text="LLM factory name", index=True)
     model_type = CharField(max_length=128, null=True, help_text="LLM, Text Embedding, Image2Text, ASR", index=True)
     llm_name = CharField(max_length=128, null=True, help_text="LLM name", default="", index=True)
-    api_key = CharField(max_length=2048, null=True, help_text="API KEY", index=True)
+    api_key = TextField(null=True, help_text="API KEY")
     api_base = CharField(max_length=255, null=True, help_text="API Base")
     max_tokens = IntegerField(default=8192, index=True)
     used_tokens = IntegerField(default=0, index=True)
@@ -684,8 +750,17 @@ class Knowledgebase(DataBaseModel):
     vector_similarity_weight = FloatField(default=0.3, index=True)
 
     parser_id = CharField(max_length=32, null=False, help_text="default parser ID", default=ParserType.NAIVE.value, index=True)
+    pipeline_id = CharField(max_length=32, null=True, help_text="Pipeline ID", index=True)
     parser_config = JSONField(null=False, default={"pages": [[1, 1000000]]})
     pagerank = IntegerField(default=0, index=False)
+
+    graphrag_task_id = CharField(max_length=32, null=True, help_text="Graph RAG task ID", index=True)
+    graphrag_task_finish_at = DateTimeField(null=True)
+    raptor_task_id = CharField(max_length=32, null=True, help_text="RAPTOR task ID", index=True)
+    raptor_task_finish_at = DateTimeField(null=True)
+    mindmap_task_id = CharField(max_length=32, null=True, help_text="Mindmap task ID", index=True)
+    mindmap_task_finish_at = DateTimeField(null=True)
+
     status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
 
     def __str__(self):
@@ -700,6 +775,7 @@ class Document(DataBaseModel):
     thumbnail = TextField(null=True, help_text="thumbnail base64 string")
     kb_id = CharField(max_length=256, null=False, index=True)
     parser_id = CharField(max_length=32, null=False, help_text="default parser ID", index=True)
+    pipeline_id = CharField(max_length=32, null=True, help_text="pipleline ID", index=True)
     parser_config = JSONField(null=False, default={"pages": [[1, 1000000]]})
     source_type = CharField(max_length=128, null=False, default="local", help_text="where dose this document come from", index=True)
     type = CharField(max_length=32, null=False, help_text="file extension", index=True)
@@ -942,6 +1018,32 @@ class Search(DataBaseModel):
         db_table = "search"
 
 
+class PipelineOperationLog(DataBaseModel):
+    id = CharField(max_length=32, primary_key=True)
+    document_id = CharField(max_length=32, index=True)
+    tenant_id = CharField(max_length=32, null=False, index=True)
+    kb_id = CharField(max_length=32, null=False, index=True)
+    pipeline_id = CharField(max_length=32, null=True, help_text="Pipeline ID", index=True)
+    pipeline_title = CharField(max_length=32, null=True, help_text="Pipeline title", index=True)
+    parser_id = CharField(max_length=32, null=False, help_text="Parser ID", index=True)
+    document_name = CharField(max_length=255, null=False, help_text="File name")
+    document_suffix = CharField(max_length=255, null=False, help_text="File suffix")
+    document_type = CharField(max_length=255, null=False, help_text="Document type")
+    source_from = CharField(max_length=255, null=False, help_text="Source")
+    progress = FloatField(default=0, index=True)
+    progress_msg = TextField(null=True, help_text="process message", default="")
+    process_begin_at = DateTimeField(null=True, index=True)
+    process_duration = FloatField(default=0)
+    dsl = JSONField(null=True, default=dict)
+    task_type = CharField(max_length=32, null=False, default="")
+    operation_status = CharField(max_length=32, null=False, help_text="Operation status")
+    avatar = TextField(null=True, help_text="avatar base64 string")
+    status = CharField(max_length=1, null=True, help_text="is it validate(0: wasted, 1: validate)", default="1", index=True)
+
+    class Meta:
+        db_table = "pipeline_operation_log"
+
+
 def migrate_db():
     logging.disable(logging.ERROR)
     migrator = DatabaseMigrator[settings.DATABASE_TYPE.upper()].value(DB)
@@ -1058,7 +1160,6 @@ def migrate_db():
         migrate(migrator.add_column("dialog", "meta_data_filter", JSONField(null=True, default={})))
     except Exception:
         pass
-
     try:
         migrate(migrator.alter_column_type("canvas_template", "title", JSONField(null=True, default=dict, help_text="Canvas title")))
     except Exception:
@@ -1073,6 +1174,42 @@ def migrate_db():
         pass
     try:
         migrate(migrator.add_column("canvas_template", "canvas_category", CharField(max_length=32, null=False, default="agent_canvas", help_text="agent_canvas|dataflow_canvas", index=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "pipeline_id", CharField(max_length=32, null=True, help_text="Pipeline ID", index=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("document", "pipeline_id", CharField(max_length=32, null=True, help_text="Pipeline ID", index=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "graphrag_task_id", CharField(max_length=32, null=True, help_text="Gragh RAG task ID", index=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "raptor_task_id", CharField(max_length=32, null=True, help_text="RAPTOR task ID", index=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "graphrag_task_finish_at", DateTimeField(null=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "raptor_task_finish_at", CharField(null=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "mindmap_task_id", CharField(max_length=32, null=True, help_text="Mindmap task ID", index=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.add_column("knowledgebase", "mindmap_task_finish_at", CharField(null=True)))
+    except Exception:
+        pass
+    try:
+        migrate(migrator.alter_column_type("tenant_llm", "api_key", TextField(null=True, help_text="API KEY")))
     except Exception:
         pass
     logging.disable(logging.NOTSET)

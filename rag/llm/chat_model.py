@@ -132,7 +132,7 @@ class Base(ABC):
             "tool_choice",
             "logprobs",
             "top_logprobs",
-            "extra_headers",
+            "extra_headers"
         }
 
         gen_conf = {k: v for k, v in gen_conf.items() if k in allowed_conf}
@@ -141,12 +141,28 @@ class Base(ABC):
 
     def _chat(self, history, gen_conf, **kwargs):
         logging.info("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        if self.model_name.lower().find("qwq") >= 0:
+            logging.info(f"[INFO] {self.model_name} detected as reasoning model, using _chat_streamly")
+
+            final_ans = ""
+            tol_token = 0
+            for delta, tol in self._chat_streamly(history, gen_conf, with_reasoning=False, **kwargs):
+                if delta.startswith("<think>") or delta.endswith("</think>"):
+                    continue
+                final_ans += delta
+                tol_token = tol
+
+            if len(final_ans.strip()) == 0:
+                final_ans = "**ERROR**: Empty response from reasoning model"
+
+            return final_ans.strip(), tol_token
+
         if self.model_name.lower().find("qwen3") >= 0:
             kwargs["extra_body"] = {"enable_thinking": False}
 
         response = self.client.chat.completions.create(model=self.model_name, messages=history, **gen_conf, **kwargs)
 
-        if (not response.choices or not response.choices[0].message or not response.choices[0].message.content):
+        if not response.choices or not response.choices[0].message or not response.choices[0].message.content:
             return "", 0
         ans = response.choices[0].message.content.strip()
         if response.choices[0].finish_reason == "length":
@@ -457,7 +473,7 @@ class Base(ABC):
         yield total_tokens
 
     def total_token_count(self, resp):
-       return total_token_count_from_response(resp)
+        return total_token_count_from_response(resp)
 
     def _calculate_dynamic_ctx(self, history):
         """Calculate dynamic context window size"""
@@ -1149,15 +1165,13 @@ class GoogleChat(Base):
             else:
                 self.client = AnthropicVertex(region=region, project_id=project_id)
         else:
-            import vertexai.generative_models as glm
-            from google.cloud import aiplatform
+            from google import genai
 
             if access_token:
-                credits = service_account.Credentials.from_service_account_info(access_token)
-                aiplatform.init(credentials=credits, project=project_id, location=region)
+                credits = service_account.Credentials.from_service_account_info(access_token, scopes=scopes)
+                self.client = genai.Client(vertexai=True, project=project_id, location=region, credentials=credits)
             else:
-                aiplatform.init(project=project_id, location=region)
-            self.client = glm.GenerativeModel(model_name=self.model_name)
+                self.client = genai.Client(vertexai=True, project=project_id, location=region)
 
     def _clean_conf(self, gen_conf):
         if "claude" in self.model_name:
@@ -1166,6 +1180,7 @@ class GoogleChat(Base):
         else:
             if "max_tokens" in gen_conf:
                 gen_conf["max_output_tokens"] = gen_conf["max_tokens"]
+                del gen_conf["max_tokens"]
             for k in list(gen_conf.keys()):
                 if k not in ["temperature", "top_p", "max_output_tokens"]:
                     del gen_conf[k]
@@ -1173,7 +1188,9 @@ class GoogleChat(Base):
 
     def _chat(self, history, gen_conf={}, **kwargs):
         system = history[0]["content"] if history and history[0]["role"] == "system" else ""
+
         if "claude" in self.model_name:
+            gen_conf = self._clean_conf(gen_conf)
             response = self.client.messages.create(
                 model=self.model_name,
                 messages=[h for h in history if h["role"] != "system"],
@@ -1189,25 +1206,63 @@ class GoogleChat(Base):
                 response["usage"]["input_tokens"] + response["usage"]["output_tokens"],
             )
 
-        self.client._system_instruction = system
-        hist = []
+        # Gemini models with google-genai SDK
+        # Set default thinking_budget=0 if not specified
+        if "thinking_budget" not in gen_conf:
+            gen_conf["thinking_budget"] = 0
+
+        thinking_budget = gen_conf.pop("thinking_budget", 0)
+        gen_conf = self._clean_conf(gen_conf)
+
+        # Build GenerateContentConfig
+        try:
+            from google.genai.types import GenerateContentConfig, ThinkingConfig, Content, Part
+        except ImportError as e:
+            logging.error(f"[GoogleChat] Failed to import google-genai: {e}. Please install: pip install google-genai>=1.41.0")
+            raise
+
+        config_dict = {}
+        if system:
+            config_dict["system_instruction"] = system
+        if "temperature" in gen_conf:
+            config_dict["temperature"] = gen_conf["temperature"]
+        if "top_p" in gen_conf:
+            config_dict["top_p"] = gen_conf["top_p"]
+        if "max_output_tokens" in gen_conf:
+            config_dict["max_output_tokens"] = gen_conf["max_output_tokens"]
+
+        # Add ThinkingConfig
+        config_dict["thinking_config"] = ThinkingConfig(thinking_budget=thinking_budget)
+
+        config = GenerateContentConfig(**config_dict)
+
+        # Convert history to google-genai Content format
+        contents = []
         for item in history:
             if item["role"] == "system":
                 continue
-            hist.append(deepcopy(item))
-            item = hist[-1]
-            if "role" in item and item["role"] == "assistant":
-                item["role"] = "model"
-            if "content" in item:
-                item["parts"] = [
-                    {
-                        "text": item.pop("content"),
-                    }
-                ]
+            # google-genai uses 'model' instead of 'assistant'
+            role = "model" if item["role"] == "assistant" else item["role"]
+            content = Content(
+                role=role,
+                parts=[Part(text=item["content"])]
+            )
+            contents.append(content)
 
-        response = self.client.generate_content(hist, generation_config=gen_conf)
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=contents,
+            config=config
+        )
+
         ans = response.text
-        return ans, response.usage_metadata.total_token_count
+        # Get token count from response
+        try:
+            total_tokens = response.usage_metadata.total_token_count
+        except Exception:
+            total_tokens = 0
+
+        return ans, total_tokens
 
     def chat_streamly(self, system, history, gen_conf={}, **kwargs):
         if "claude" in self.model_name:
@@ -1234,28 +1289,65 @@ class GoogleChat(Base):
 
             yield total_tokens
         else:
-            self.client._system_instruction = system
-            if "max_tokens" in gen_conf:
-                gen_conf["max_output_tokens"] = gen_conf["max_tokens"]
-            for k in list(gen_conf.keys()):
-                if k not in ["temperature", "top_p", "max_output_tokens"]:
-                    del gen_conf[k]
-            for item in history:
-                if "role" in item and item["role"] == "assistant":
-                    item["role"] = "model"
-                if "content" in item:
-                    item["parts"] = item.pop("content")
+            # Gemini models with google-genai SDK
             ans = ""
+            total_tokens = 0
+
+            # Set default thinking_budget=0 if not specified
+            if "thinking_budget" not in gen_conf:
+                gen_conf["thinking_budget"] = 0
+
+            thinking_budget = gen_conf.pop("thinking_budget", 0)
+            gen_conf = self._clean_conf(gen_conf)
+
+            # Build GenerateContentConfig
             try:
-                response = self.model.generate_content(history, generation_config=gen_conf, stream=True)
-                for resp in response:
-                    ans = resp.text
+                from google.genai.types import GenerateContentConfig, ThinkingConfig, Content, Part
+            except ImportError as e:
+                logging.error(f"[GoogleChat] Failed to import google-genai: {e}. Please install: pip install google-genai>=1.41.0")
+                raise
+
+            config_dict = {}
+            if system:
+                config_dict["system_instruction"] = system
+            if "temperature" in gen_conf:
+                config_dict["temperature"] = gen_conf["temperature"]
+            if "top_p" in gen_conf:
+                config_dict["top_p"] = gen_conf["top_p"]
+            if "max_output_tokens" in gen_conf:
+                config_dict["max_output_tokens"] = gen_conf["max_output_tokens"]
+
+            # Add ThinkingConfig
+            config_dict["thinking_config"] = ThinkingConfig(thinking_budget=thinking_budget)
+
+            config = GenerateContentConfig(**config_dict)
+
+            # Convert history to google-genai Content format
+            contents = []
+            for item in history:
+                # google-genai uses 'model' instead of 'assistant'
+                role = "model" if item["role"] == "assistant" else item["role"]
+                content = Content(
+                    role=role,
+                    parts=[Part(text=item["content"])]
+                )
+                contents.append(content)
+
+            try:
+                for chunk in self.client.models.generate_content_stream(
+                    model=self.model_name,
+                    contents=contents,
+                    config=config
+                ):
+                    text = chunk.text
+                    ans = text
+                    total_tokens += num_tokens_from_string(text)
                     yield ans
 
             except Exception as e:
                 yield ans + "\n**ERROR**: " + str(e)
 
-            yield response._chunks[-1].usage_metadata.total_token_count
+            yield total_tokens
 
 
 class GPUStackChat(Base):
@@ -1274,6 +1366,14 @@ class TokenPonyChat(Base):
     def __init__(self, key, model_name, base_url="https://ragflow.vip-api.tokenpony.cn/v1", **kwargs):
         if not base_url:
             base_url = "https://ragflow.vip-api.tokenpony.cn/v1"
+
+class DeerAPIChat(Base):
+    _FACTORY_NAME = "DeerAPI"
+
+    def __init__(self, key, model_name, base_url="https://api.deerapi.com/v1", **kwargs):
+        if not base_url:
+            base_url = "https://api.deerapi.com/v1"
+        super().__init__(key, model_name, base_url, **kwargs)
 
 
 class LiteLLMBase(ABC):
@@ -1305,10 +1405,6 @@ class LiteLLMBase(ABC):
         "302.AI",
     ]
 
-    import litellm
-
-    litellm._turn_on_debug()
-
     def __init__(self, key, model_name, base_url=None, **kwargs):
         self.timeout = int(os.environ.get("LM_TIMEOUT_SECONDS", 600))
         self.provider = kwargs.get("provider", "")
@@ -1329,6 +1425,9 @@ class LiteLLMBase(ABC):
             self.bedrock_ak = json.loads(key).get("bedrock_ak", "")
             self.bedrock_sk = json.loads(key).get("bedrock_sk", "")
             self.bedrock_region = json.loads(key).get("bedrock_region", "")
+        elif self.provider == SupportedLiteLLMProvider.OpenRouter:
+            self.api_key = json.loads(key).get("api_key", "")
+            self.provider_order = json.loads(key).get("provider_order", "")
 
     def _get_delay(self):
         """Calculate retry delay time"""
@@ -1373,7 +1472,6 @@ class LiteLLMBase(ABC):
             timeout=self.timeout,
         )
         # response = self.client.chat.completions.create(model=self.model_name, messages=history, **gen_conf, **kwargs)
-
         if any([not response.choices, not response.choices[0].message, not response.choices[0].message.content]):
             return "", 0
         ans = response.choices[0].message.content.strip()
@@ -1524,6 +1622,24 @@ class LiteLLMBase(ABC):
                     "aws_region_name": self.bedrock_region,
                 }
             )
+
+        if self.provider == SupportedLiteLLMProvider.OpenRouter:
+            if self.provider_order:
+                def _to_order_list(x):
+                    if x is None:
+                        return []
+                    if isinstance(x, str):
+                        return [s.strip() for s in x.split(",") if s.strip()]
+                    if isinstance(x, (list, tuple)):
+                        return [str(s).strip() for s in x if str(s).strip()]
+                    return []
+                extra_body = {}
+                provider_cfg = {}
+                provider_order = _to_order_list(self.provider_order)
+                provider_cfg["order"] = provider_order
+                provider_cfg["allow_fallbacks"] = False
+                extra_body["provider"] = provider_cfg
+                completion_args.update({"extra_body": extra_body})
         return completion_args
 
     def chat_with_tools(self, system: str, history: list, gen_conf: dict = {}):

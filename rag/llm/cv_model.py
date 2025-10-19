@@ -26,7 +26,7 @@ from openai.lib.azure import AzureOpenAI
 from zhipuai import ZhipuAI
 from rag.nlp import is_english
 from rag.prompts.generator import vision_llm_describe_prompt
-from rag.utils import num_tokens_from_string
+from rag.utils import num_tokens_from_string, total_token_count_from_response
 
 
 class Base(ABC):
@@ -38,6 +38,7 @@ class Base(ABC):
         self.is_tools = False
         self.tools = []
         self.toolcall_sessions = {}
+        self.extra_body = None
 
     def describe(self, image):
         raise NotImplementedError("Please implement encode method!")
@@ -77,7 +78,8 @@ class Base(ABC):
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
-                messages=self._form_history(system, history, images)
+                messages=self._form_history(system, history, images),
+                extra_body=self.extra_body,
             )
             return response.choices[0].message.content.strip(), response.usage.total_tokens
         except Exception as e:
@@ -90,7 +92,8 @@ class Base(ABC):
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=self._form_history(system, history, images),
-                stream=True
+                stream=True,
+                extra_body=self.extra_body,
             )
             for resp in response:
                 if not resp.choices[0].delta.content:
@@ -125,7 +128,7 @@ class Base(ABC):
             b64 = base64.b64encode(data).decode("utf-8")
             return f"data:{mime};base64,{b64}"
         with BytesIO() as buffered:
-            fmt = "JPEG"
+            fmt = "jpeg"
             try:
                 image.save(buffered, format="JPEG")
             except Exception:
@@ -133,10 +136,10 @@ class Base(ABC):
                 buffered.seek(0)
                 buffered.truncate()
                 image.save(buffered, format="PNG")
-                fmt = "PNG"
+                fmt = "png"
             data = buffered.getvalue()
             b64 = base64.b64encode(data).decode("utf-8")
-            mime = f"image/{fmt.lower()}"
+            mime = f"image/{fmt}"
         return f"data:{mime};base64,{b64}"
 
     def prompt(self, b64):
@@ -177,16 +180,18 @@ class GptV4(Base):
         res = self.client.chat.completions.create(
             model=self.model_name,
             messages=self.prompt(b64),
+            extra_body=self.extra_body,
         )
-        return res.choices[0].message.content.strip(), res.usage.total_tokens
+        return res.choices[0].message.content.strip(), total_token_count_from_response(res)
 
     def describe_with_prompt(self, image, prompt=None):
         b64 = self.image2base64(image)
         res = self.client.chat.completions.create(
             model=self.model_name,
             messages=self.vision_llm_prompt(b64, prompt),
+            extra_body=self.extra_body,
         )
-        return res.choices[0].message.content.strip(), res.usage.total_tokens
+        return res.choices[0].message.content.strip(),total_token_count_from_response(res)
 
 
 class AzureGptV4(GptV4):
@@ -249,6 +254,17 @@ class StepFunCV(GptV4):
         self.lang = lang
         Base.__init__(self, **kwargs)
 
+class VolcEngineCV(GptV4):
+    _FACTORY_NAME = "VolcEngine"
+
+    def __init__(self, key, model_name, lang="Chinese", base_url="https://ark.cn-beijing.volces.com/api/v3", **kwargs):
+        if not base_url:
+            base_url = "https://ark.cn-beijing.volces.com/api/v3"
+        ark_api_key = json.loads(key).get("ark_api_key", "")
+        self.client = OpenAI(api_key=ark_api_key, base_url=base_url)
+        self.model_name = json.loads(key).get("ep_id", "") + json.loads(key).get("endpoint_id", "")
+        self.lang = lang
+        Base.__init__(self, **kwargs)
 
 class LmStudioCV(GptV4):
     _FACTORY_NAME = "LM-Studio"
@@ -327,10 +343,27 @@ class OpenRouterCV(GptV4):
     ):
         if not base_url:
             base_url = "https://openrouter.ai/api/v1"
-        self.client = OpenAI(api_key=key, base_url=base_url)
+        api_key = json.loads(key).get("api_key", "")
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model_name = model_name
         self.lang = lang
         Base.__init__(self, **kwargs)
+        provider_order = json.loads(key).get("provider_order", "")
+        self.extra_body = {}
+        if provider_order:
+            def _to_order_list(x):
+                if x is None:
+                    return []
+                if isinstance(x, str):
+                    return [s.strip() for s in x.split(",") if s.strip()]
+                if isinstance(x, (list, tuple)):
+                    return [str(s).strip() for s in x if str(s).strip()]
+                return []
+            provider_cfg = {}
+            provider_order = _to_order_list(provider_order)
+            provider_cfg["order"] = provider_order
+            provider_cfg["allow_fallbacks"] = False
+            self.extra_body["provider"] = provider_cfg
 
 
 class LocalAICV(GptV4):
@@ -522,11 +555,10 @@ class GeminiCV(Base):
         )
         b64 = self.image2base64(image)
         with BytesIO(base64.b64decode(b64)) as bio:
-            img = open(bio)
-            input = [prompt, img]
-            res = self.model.generate_content(input)
-            img.close()
-            return res.text, res.usage_metadata.total_token_count
+            with open(bio) as img:
+                input = [prompt, img]
+                res = self.model.generate_content(input)
+                return res.text, total_token_count_from_response(res)
 
     def describe_with_prompt(self, image, prompt=None):
         from PIL.Image import open
@@ -534,11 +566,10 @@ class GeminiCV(Base):
         b64 = self.image2base64(image)
         vision_prompt = prompt if prompt else vision_llm_describe_prompt()
         with BytesIO(base64.b64decode(b64)) as bio:
-            img = open(bio)
-            input = [vision_prompt, img]
-            res = self.model.generate_content(input)
-            img.close()
-            return res.text, res.usage_metadata.total_token_count
+            with open(bio) as img:
+                input = [vision_prompt, img]
+                res = self.model.generate_content(input)
+                return res.text, total_token_count_from_response(res)
 
     def chat(self, system, history, gen_conf, images=[]):
         generation_config = dict(temperature=gen_conf.get("temperature", 0.3), top_p=gen_conf.get("top_p", 0.7))
@@ -547,7 +578,7 @@ class GeminiCV(Base):
                 self._form_history(system, history, images),
                 generation_config=generation_config)
             ans = response.text
-            return ans, response.usage_metadata.total_token_count
+            return ans, total_token_count_from_response(ans)
         except Exception as e:
             return "**ERROR**: " + str(e), 0
 
@@ -570,10 +601,7 @@ class GeminiCV(Base):
         except Exception as e:
             yield ans + "\n**ERROR**: " + str(e)
 
-        if response and hasattr(response, "usage_metadata") and hasattr(response.usage_metadata, "total_token_count"):
-            yield response.usage_metadata.total_token_count
-        else:
-            yield 0
+        yield total_token_count_from_response(response)
 
 
 class NvidiaCV(Base):
@@ -619,7 +647,7 @@ class NvidiaCV(Base):
         response = response.json()
         return (
             response["choices"][0]["message"]["content"].strip(),
-            response["usage"]["total_tokens"],
+            total_token_count_from_response(response),
         )
 
     def _request(self, msg, gen_conf={}):
@@ -642,7 +670,7 @@ class NvidiaCV(Base):
         response = self._request(vision_prompt)
         return (
             response["choices"][0]["message"]["content"].strip(),
-            response["usage"]["total_tokens"],
+            total_token_count_from_response(response)
         )
 
     def chat(self, system, history, gen_conf, images=[], **kwargs):
@@ -650,7 +678,7 @@ class NvidiaCV(Base):
             response = self._request(self._form_history(system, history, images), gen_conf)
             return (
                 response["choices"][0]["message"]["content"].strip(),
-                response["usage"]["total_tokens"],
+                total_token_count_from_response(response)
             )
         except Exception as e:
             return "**ERROR**: " + str(e), 0
@@ -661,7 +689,7 @@ class NvidiaCV(Base):
             response = self._request(self._form_history(system, history, images), gen_conf)
             cnt = response["choices"][0]["message"]["content"]
             if "usage" in response and "total_tokens" in response["usage"]:
-                total_tokens += response["usage"]["total_tokens"]
+                total_tokens +=  total_token_count_from_response(response)
             for resp in cnt:
                 yield resp
         except Exception as e:

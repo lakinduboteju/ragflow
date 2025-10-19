@@ -830,7 +830,8 @@ Success:
             "update_time": 1728533243536,
             "vector_similarity_weight": 0.3
         }
-    ]
+    ],
+    "total": 1
 }
 ```
 
@@ -1280,7 +1281,7 @@ Success:
                 "update_time": 1728897061948
             }
         ],
-        "total": 1
+        "total_datasets": 1
     }
 }
 ```
@@ -1822,7 +1823,21 @@ curl --request POST \
      {
           "question": "What is advantage of ragflow?",
           "dataset_ids": ["b2a62730759d11ef987d0242ac120004"],
-          "document_ids": ["77df9ef4759a11ef8bdd0242ac120004"]
+          "document_ids": ["77df9ef4759a11ef8bdd0242ac120004"],
+          "metadata_condition": {
+            "conditions": [
+              {
+                "name": "author",
+                "comparison_operator": "=",
+                "value": "Toby"
+              },
+              {
+                "name": "url",
+                "comparison_operator": "not contains",
+                "value": "amd"
+              }
+            ]
+          }
      }'
 ```
 
@@ -1857,7 +1872,25 @@ curl --request POST \
 - `"cross_languages"`: (*Body parameter*) `list[string]`  
   The languages that should be translated into, in order to achieve keywords retrievals in different languages.
 - `"metadata_condition"`: (*Body parameter*), `object`  
-  The metadata condition for filtering chunks.
+  The metadata condition used for filtering chunks:  
+  - `"conditions"`: (*Body parameter*), `array`  
+    A list of metadata filter conditions.  
+    - `"name"`: `string` - The metadata field name to filter by, e.g., `"author"`, `"company"`, `"url"`. Ensure this parameter before use. See [Set metadata](../guides/dataset/set_metadata.md) for details.
+    - `comparison_operator`: `string` - The comparison operator. Can be one of: 
+      - `"contains"`
+      - `"not contains"`
+      - `"start with"`
+      - `"empty"`
+      - `"not empty"`
+      - `"="`
+      - `"≠"`
+      - `">"`
+      - `"<"`
+      - `"≥"`
+      - `"≤"`
+    - `"value"`: `string` - The value to compare.
+
+
 #### Response
 
 Success:
